@@ -1,0 +1,27 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Logs and run outputs
+logs/
+runs/
+results/
+
+# Checkpoints / large binaries
+*.bin
+*.ckpt
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE/editor
+.vscode/
+.idea/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
