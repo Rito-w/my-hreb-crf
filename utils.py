@@ -13,7 +13,7 @@ def tokenize(batch, tokenizer, label_names, max_length=64):
         padding="max_length",
     )
 
-    # Build a robust B->I mapping based on label strings, avoid odd/even id assumptions
+    # 根据标签字符串构建稳健的 B->I 映射，避免依赖奇偶 ID 的脆弱假设
     name_to_id = {name: idx for idx, name in enumerate(label_names)}
     to_inside = list(range(len(label_names)))
     for idx, name in enumerate(label_names):
@@ -32,12 +32,12 @@ def tokenize(batch, tokenizer, label_names, max_length=64):
             if word_idx is None:
                 label_ids.append(-100)
             elif word_idx != previous_word_idx:
-                # first sub-token takes the original word label id
+                # 首个子词沿用原始词级标签 ID
                 wid = labels_for_one_example[word_idx]
                 wid = int(wid) if isinstance(wid, (int, np.integer)) else wid
                 label_ids.append(wid)
             else:
-                # subsequent sub-tokens take the corresponding I- label id if exists
+                # 后续子词使用对应 I- 标签（若存在），否则回退为原 ID
                 wid = labels_for_one_example[word_idx]
                 wid = int(wid) if isinstance(wid, (int, np.integer)) else wid
                 wid = wid if (0 <= wid < len(to_inside)) else 0
@@ -54,6 +54,7 @@ def compute_metrics(pred, dataset):
     preds_arr = pred.predictions[0] if isinstance(pred.predictions, (list, tuple)) else pred.predictions
     preds = preds_arr.flatten().astype(int)
     _label = dataset["train"].features["ner_tags"].feature.names
+    # 过滤掉被忽略的位点与纯 O-O 情况
     true_predictions = [
         _label[pred] for pred, label in zip(preds, labels) if label != -100 and not (label == 0 and pred == 0)
     ]
@@ -77,6 +78,7 @@ def compute_metrics(pred, dataset):
     }
 
 
+# 将 BIO 序列转为实体跨度列表（type, start, end）
 def _bio_spans(seq):
     spans = []  # (type, start, end)
     cur_t, cur_s = None, None
@@ -93,12 +95,12 @@ def _bio_spans(seq):
         elif tag.startswith('I-'):
             t = tag[2:]
             if cur_t is None:
-                cur_t, cur_s = t, i  # 容错：I 当新段开始
+                cur_t, cur_s = t, i  # 容错：孤立的 I 当作新段开始
             elif t != cur_t:
                 spans.append((cur_t, cur_s, i))
                 cur_t, cur_s = t, i
         else:
-            # 未知标签，直接断开
+            # 未知标签，直接断开当前段
             if cur_t is not None:
                 spans.append((cur_t, cur_s, i))
                 cur_t, cur_s = None, None
@@ -109,21 +111,62 @@ def _bio_spans(seq):
 
 def compute_metrics_entity(pred, dataset):
     names = dataset["train"].features["ner_tags"].feature.names
-    labels = pred.label_ids.flatten()
     preds_arr = pred.predictions[0] if isinstance(pred.predictions, (list, tuple)) else pred.predictions
-    preds = preds_arr.flatten().astype(int)
-    # 过滤掉 -100
-    gold_tags = [names[l] for l in labels if l != -100]
-    pred_tags = [names[p] for p, l in zip(preds, labels) if l != -100]
-    # 还原为句子级（这里按 max_length 切分很难恢复准确句界；用简单聚合：直接整体当一条序列比对）
-    gold_spans = set(_bio_spans(gold_tags))
-    pred_spans = set(_bio_spans(pred_tags))
-    inter = len(gold_spans & pred_spans)
-    p = inter / len(pred_spans) if len(pred_spans) else 0.0
-    r = inter / len(gold_spans) if len(gold_spans) else 0.0
-    f1 = 2 * p * r / (p + r) if (p + r) else 0.0
-    print(f"Entity-level (span) metrics -> P: {p:.4f}, R: {r:.4f}, F1: {f1:.4f}")
-    return {"precision": p, "recall": r, "f1": f1}
+    preds = preds_arr
+    labels = pred.label_ids
+
+    # 基于 -100 掩码，按句重建标签序列
+    y_true, y_pred = [], []
+    try:
+        B, T = labels.shape
+    except Exception:
+        # 兜底：无法按句还原时，退回到旧的扁平化计算
+        labels = labels.flatten()
+        preds = preds.flatten().astype(int)
+        gold_tags = [names[l] for l in labels if l != -100]
+        pred_tags = [names[p] for p, l in zip(preds, labels) if l != -100]
+        gold_spans = set(_bio_spans(gold_tags))
+        pred_spans = set(_bio_spans(pred_tags))
+        inter = len(gold_spans & pred_spans)
+        p = inter / len(pred_spans) if len(pred_spans) else 0.0
+        r = inter / len(gold_spans) if len(gold_spans) else 0.0
+        f1 = 2 * p * r / (p + r) if (p + r) else 0.0
+        print(f"Entity-level (span) metrics -> P: {p:.4f}, R: {r:.4f}, F1: {f1:.4f}")
+        return {"precision": p, "recall": r, "f1": f1}
+
+    for i in range(B):
+        true_row, pred_row = [], []
+        for l, p in zip(labels[i].tolist(), preds[i].tolist()):
+            if l == -100:
+                continue
+            true_row.append(names[int(l)])
+            pred_row.append(names[int(p)])
+        if true_row:
+            y_true.append(true_row)
+            y_pred.append(pred_row)
+
+    # 优先使用 seqeval（标准实体级指标）；不可用时回退到 span 级实现
+    try:
+        from seqeval.metrics import precision_score as seqeval_precision
+        from seqeval.metrics import recall_score as seqeval_recall
+        from seqeval.metrics import f1_score as seqeval_f1
+        p = float(seqeval_precision(y_true, y_pred))
+        r = float(seqeval_recall(y_true, y_pred))
+        f1 = float(seqeval_f1(y_true, y_pred))
+        print(f"SeqEval entity-level -> P: {p:.4f}, R: {r:.4f}, F1: {f1:.4f}")
+        return {"precision": p, "recall": r, "f1": f1}
+    except Exception:
+        # span 级回退（将每个句子视为独立序列）
+        gold_spans_all, pred_spans_all = set(), set()
+        for gt, pd in zip(y_true, y_pred):
+            gold_spans_all |= set(_bio_spans(gt))
+            pred_spans_all |= set(_bio_spans(pd))
+        inter = len(gold_spans_all & pred_spans_all)
+        p = inter / len(pred_spans_all) if len(pred_spans_all) else 0.0
+        r = inter / len(gold_spans_all) if len(gold_spans_all) else 0.0
+        f1 = 2 * p * r / (p + r) if (p + r) else 0.0
+        print(f"Entity-level (span) metrics -> P: {p:.4f}, R: {r:.4f}, F1: {f1:.4f}")
+        return {"precision": p, "recall": r, "f1": f1}
 
 
 class WeightLoggerCallback(TrainerCallback):
@@ -131,6 +174,7 @@ class WeightLoggerCallback(TrainerCallback):
         if state.is_local_process_zero:
             model = kwargs.get('model')
             if model is not None:
+                # 打印当前门控权重（sigmoid 后的值），便于训练过程观察
                 r_lstm = torch.sigmoid(model.r_lstm).item()
                 r_mega = torch.sigmoid(model.r_mega).item()
                 print(f"Current weight of:")

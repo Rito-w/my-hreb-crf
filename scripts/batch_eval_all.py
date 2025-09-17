@@ -5,9 +5,9 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(os.getcwd())
-BASE = ROOT / "new-herb-crf"
+BASE = ROOT / "my-hreb-crf"
 PY = "python"
-RUN_SCRIPT = ROOT / "new-herb-crf" / "run_eval.py"
+RUN_SCRIPT = ROOT / "my-hreb-crf" / "run_eval.py"
 HF_HOME = ROOT / "data" / "hf"
 
 DATASETS = [
@@ -17,7 +17,7 @@ DATASETS = [
     ("cross_ner_all", ROOT / "data" / "hf" / "local" / "cross_ner_all"),
 ]
 
-# Default hyper-params (conservative to avoid OOM)
+# 默认超参数（保守设置以避免显存溢出 OOM）
 BERT_MODEL = os.environ.get("EVAL_BERT_MODEL", "hfl/chinese-roberta-wwm-ext-large")
 TRAIN_BS = int(os.environ.get("EVAL_TRAIN_BS", 2))
 EVAL_BS = int(os.environ.get("EVAL_EVAL_BS", 8))
@@ -33,7 +33,7 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 summary = {}
 
-# Helper to find latest result dir produced by run_eval (model-dataset-timestamp)
+# 工具函数：查找 run_eval 生成的最新结果目录（命名为 model-dataset-timestamp）
 def _safe_name(s: str) -> str:
     s = s.replace(os.sep, "-").replace(" ", "_")
     return "".join(c if c.isalnum() or c in ("-", "_", ".") else "-" for c in s)
@@ -55,7 +55,7 @@ for name, path in DATASETS:
     env["HF_DATASETS_CACHE"] = str(HF_HOME / "datasets")
     env["HF_HUB_CACHE"] = str(HF_HOME / "hub")
     env["HF_OFFLINE"] = env.get("HF_OFFLINE", "1")
-    # Prefer local saved dataset
+    # 优先使用本地保存的数据集
     env["DATASET_PATH"] = str(path)
     env["BERT_MODEL"] = BERT_MODEL
     env["TRAIN_SAMPLES"] = "0"
@@ -65,9 +65,14 @@ for name, path in DATASETS:
     env["EVAL_BS"] = str(EVAL_BS)
     env["GRAD_ACC"] = str(GRAD_ACC)
     env["MAX_LENGTH"] = str(MAX_LENGTH)
-    env["METRIC"] = "entity"
-    # Do not set OUTPUT_DIR; run_eval will write to results/{model}-{dataset}-{ts}
-    env["EVAL_SAVE"] = "0"  # disable checkpoints to save disk
+    # 指标选择（默认 entity）；允许由外部环境变量覆盖
+    env["METRIC"] = env.get("METRIC", "entity")
+    # 新增的行为开关
+    env["MODEL_PAPER_ALIGNED"] = env.get("MODEL_PAPER_ALIGNED", "0")
+    env["MEGA_LAPLACIAN"] = env.get("MEGA_LAPLACIAN", "0")
+    env["DYNAMIC_PADDING"] = env.get("DYNAMIC_PADDING", "1")
+    # 不设置 OUTPUT_DIR；run_eval 会写入 results/{model}-{dataset}-{ts}
+    env["EVAL_SAVE"] = "0"  # 关闭保存以节省磁盘空间
 
     log_file = LOG_DIR / f"eval_{name}.log"
     print(f"[RUN] {name}")
@@ -78,7 +83,7 @@ for name, path in DATASETS:
         code = proc.returncode
         print(f"[DONE] {name} exit={code}")
 
-    # After run, find latest dir matching pattern and read metrics
+    # 运行结束后，查找匹配前缀的最新目录并读取指标
     prefix = f"{MODEL_KEY}-{_safe_name(name)}-"
     candidates = [d for d in RESULTS_ROOT.glob(f"{prefix}*") if d.is_dir()]
     if not candidates:
@@ -95,7 +100,7 @@ for name, path in DATASETS:
         except Exception as e:
             summary[name] = {"error": str(e)}
 
-# write summary
+# 写出汇总
 with open(RUN_ROOT / "summary.json", "w", encoding="utf-8") as f:
     json.dump(summary, f, ensure_ascii=False, indent=2)
 print("All done. Summary at:", RUN_ROOT / "summary.json")
