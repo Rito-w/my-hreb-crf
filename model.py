@@ -8,6 +8,15 @@ import os
 import inspect
 from typing import Optional
 
+# GlobalPointer components (reference: https://github.com/gaohongkui/GlobalPointer_pytorch)
+from .global_pointer import (
+    GlobalPointer,
+    build_gp_label_mappings,
+    make_gp_targets,
+    gp_decode_to_bio,
+    gp_loss_bce,
+)
+
 
 class ReducedBiasResidual(nn.Module):
     """
@@ -85,6 +94,25 @@ class HREBCRF(BertPreTrainedModel):
         self.crf = CRF(num_tags=config.num_labels, batch_first=True)
         self.init_weights()
 
+
+        # 可切换的解码头：CRF（默认）或 GlobalPointer
+        self.head_kind = os.environ.get("HEAD_KIND", "crf").strip().lower()
+        if self.head_kind == "globalpointer":
+            try:
+                id2label = getattr(self.config, "id2label", None) or {}
+            except Exception:
+                id2label = {}
+            types, label2type, type2bio_ids = build_gp_label_mappings(id2label)
+            if len(types) == 0:
+                # 若标签集中没有实体类型，回退到 CRF 头
+                self.head_kind = "crf"
+            else:
+                self.gp_types = types
+                self.gp_label2type = label2type
+                self.gp_type2bio = type2bio_ids
+                gp_head_size = int(os.environ.get("GP_HEAD_SIZE", "64"))
+                self.gp = GlobalPointer(config.hidden_size, heads=len(types), head_size=gp_head_size, rope=True)
+
         # 可选的“降低偏置”残差：在残差连接上引入动态 alpha/beta 门控
         self._reduced_bias_enabled = os.environ.get("REDUCED_BIAS", "0").strip().lower() in ("1", "true", "yes", "y", "on")
         if self._reduced_bias_enabled:
@@ -149,6 +177,29 @@ class HREBCRF(BertPreTrainedModel):
             merge_output = self.layer_norm(fused)
         else:
             merge_output = self.layer_norm(merged)
+
+        # —— GlobalPointer head (optional) ——
+        if getattr(self, "head_kind", "crf") == "globalpointer":
+            # token_mask: prefer label mask (ignores special tokens), else attention_mask, else all True
+            if labels is not None:
+                token_mask = (labels != -100)
+            elif attention_mask is not None:
+                token_mask = attention_mask.bool()
+            else:
+                token_mask = torch.ones(merge_output.size()[:2], dtype=torch.bool, device=merge_output.device)
+
+            gp_logits = self.gp(merge_output, token_mask=token_mask)
+            gp_loss = None
+            if labels is not None:
+                lbls = labels.to(dtype=torch.long)
+                targets = make_gp_targets(lbls, self.gp_label2type, token_mask, num_types=len(self.gp_types))
+                gp_loss = gp_loss_bce(gp_logits, targets)
+
+            pred_tags = gp_decode_to_bio(gp_logits, token_mask, self.gp_type2bio, self.gp_types, threshold=0.0)
+            if not return_dict:
+                return (gp_loss, pred_tags, gp_logits) if gp_loss is not None else (pred_tags, gp_logits)
+            return (gp_loss, pred_tags, gp_logits) if gp_loss is not None else (pred_tags, gp_logits)
+
 
         logits = self.classifier(merge_output)
 
